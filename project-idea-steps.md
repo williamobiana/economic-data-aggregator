@@ -12,11 +12,8 @@ Build in this order — each step depends on the ones above.
 
 Two `curl`s and a weekend. Honour the 5-minute floor. These are the only open decisions left.
 
-- Does `ff_calendar_nextweek.json` exist? → decides the next-week probe.
 - **When does the week roll over?** Fetch Sat evening + Sun morning, diff. Sets the sweep time.
-- What does `date` carry for All-Day / Tentative / Holiday rows?
 - **Do titles drift within a week?** Diff the same event Wed vs Sat. Whatever drifts, `normalize_title` must absorb.
-- **Does `(country, title)` ever repeat in one week?** Assume no unless observed; if yes, add event date to the identity tuple (step 3).
 - Save every payload — test fixtures, and the only record of this week.
 
 ## 1. Pure modules + tests
@@ -47,7 +44,7 @@ Keep the string local for now; it goes into SSM in step 5.
 
 Once, laptop → Supabase, raw `.sql`. No Alembic. Creates `raw_snapshots`, `events`, `fetch_log`, indexes, and the four empty `actual_*` columns (spec §4).
 
-**`events` gets a named `UNIQUE` constraint on `(country, normalized_title, week_key)`.** `source_suffix` does *not* participate — it's drift for `normalize_title` to absorb. Add event date only if Phase 0 found real same-week repeats.
+**`events` gets a named `UNIQUE` constraint on `(country, normalized_title, week_key, event_timestamp)`.** `source_suffix` does *not* participate — it's drift for `normalize_title` to absorb.
 
 Must be a constraint, not a convention: step 4's `ON CONFLICT` needs a target, and step 10's check only means something if the DB enforced it all along. Changing it later means deduplicating first.
 
@@ -59,7 +56,7 @@ Spec §6 order: **guard on `fetch_log`** → fetch → reject HTML → `json.loa
 
 - Guard calls `guard.already_satisfied`. The handler fetches rows and acts on the answer; it doesn't re-derive it.
 - S3 before parse, so a parser crash still leaves the payload recoverable.
-- `week_offset` and `week_final` from the event payload — one function, every schedule.
+- `week_final` from the event payload — one function, every schedule.
 - Conditional upsert (`IS DISTINCT FROM`, spec §4) targeting the step 3 constraint.
 - `httpx`, **10s connect / 20s read timeout**. A hung socket costs the whole slot.
 
@@ -85,7 +82,7 @@ Check the Lambda runtime deprecation calendar — with no template, a runtime bu
 ## 7. EventBridge schedules
 
 1. **Scheduler IAM role** — trust `scheduler.amazonaws.com`, `lambda:InvokeFunction` on the harvester. Needs its own role; won't reuse the Lambda one. Step 8 adds the export ARN.
-2. **Schedules**, cron in UTC — four daily harvest slots, Saturday sweep with `week_final: true`, next-week probe with `week_offset: 1` only if Phase 0 confirmed the file.
+2. **Schedules**, cron in UTC — four daily harvest slots, Saturday sweep with `week_final: true`.
 3. **Retry rule 10 minutes after each main slot**, firing unconditionally. The guard exits immediately if the paired attempt succeeded. Costs nothing when healthy, survives the process being killed. Configuration only — if you're writing skip logic here, it belongs in `guard.py`.
 
 **Set the sweep time from Phase 0, not the placeholder.** Spec §3's Sat 23:00 UTC assumes rollover at or after midnight ET.
