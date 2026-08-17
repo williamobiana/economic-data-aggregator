@@ -21,7 +21,7 @@ A scheduled Lambda downloads `https://nfs.faireconomy.media/ff_calendar_thisweek
 ```
 
 - `title` — display string; unescape slashes on parse.
-- `country` — keep `USD, EUR, GBP, JPY, AUD, NZD, CAD, CHF`, **all impact levels**; drop the rest (the feed also carries `CNY`). You can't retro-collect what you filter out.
+- `country` — keep `USD, EUR, GBP, JPY, AUD, NZD, CAD, CHF, CNY`.
 - `date` — ISO 8601 with offset, on **every** row without exception. Convert to UTC at ingestion. **Parse the offset from the string, never hard-code `-04:00`** — it becomes `-05:00` in November and every winter event silently shifts an hour.
 - `impact` — `High | Medium | Low | Holiday`; log unknown variants. **There is no Tentative marker** — tentative releases carry a fake minute-precise time and simply move.
 - `forecast`, `previous` — display strings. **Blank is common and valid** (80 of 244 rows measured). There is **no `actual` field**.
