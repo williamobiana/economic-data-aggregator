@@ -1,20 +1,12 @@
 # FF Harvester — build & deploy steps
 
-Companion to `project-idea.md` (spec v1.1). Spec says *what* and *why*; this says *in what order*. Spec wins on conflicts.
+Companion to `project-idea.md` (spec v1.2). Spec says *what* and *why*; this says *in what order*. This document is the newer of the two — the spec is refactored from it, not the other way round.
 
-**Target:** Python 3.11, AWS Lambda, Supabase Postgres, S3. Steps 0–4 are AWS-free. Manual deploy, no IaC.
+**Target:** Python 3.11, AWS Lambda, Supabase Postgres, S3. Steps 1–4 are AWS-free. Manual deploy, no IaC.
 
 Build in this order — each step depends on the ones above.
 
 ---
-
-## 0. Observe the feed first
-
-Two `curl`s and a weekend. Honour the 5-minute floor. These are the only open decisions left.
-
-- **When does the week roll over?** Fetch Sat evening + Sun morning, diff. Sets the sweep time.
-- **Do titles drift within a week?** Diff the same event Wed vs Sat. Whatever drifts, `normalize_title` must absorb.
-- Save every payload — test fixtures, and the only record of this week.
 
 ## 1. Pure modules + tests
 
@@ -22,7 +14,7 @@ No AWS, no database, no mocking.
 
 - `parse.py` — spec §5. `num` expanded, `unit` a dimension, scale suffix separate, `flag` returned *and* persisted. Frozen `@dataclass`, not a dict.
 - `week.py` — `ff_week_start`. Sunday-start, `America/New_York`. Not ISO weeks — `isocalendar()` starts Monday and splits each feed week.
-- `identity.py` — `normalize_title` + `event_key`. The one definition of "same event". Assert Phase 0's drift cases collapse and distinct events don't.
+- `identity.py` — `normalize_title` + `event_key`. The one definition of "same event". Titles were measured and do not drift, so assert the negative — same `(country, date)` across fetches yields the same title — and assert distinct events stay distinct.
 - `guard.py` — `already_satisfied(rows, slot)`. Pure logic over query results, no connection. Step 7 depends on it.
 
 Stdlib only:
@@ -30,7 +22,9 @@ Stdlib only:
 - `datetime.fromisoformat` handles the feed's offset. Never construct the offset — DST moves it to `-05:00` in November.
 - `zoneinfo.ZoneInfo("America/New_York")`. No `pytz`, no `dateutil`. Add `tzdata` on Lambda.
 
-Test `week.py` (Sunday event, Sat 20:00 ET event, either side of November DST) and `identity.py` (every Phase 0 variant) harder than the parser. A bad parse logs a warning; a bad week or identity key silently duplicates rows.
+Test `week.py` (Sunday event, Sat 20:00 ET event, either side of November DST) and `identity.py` (the cross-country title collisions, and the two same-week repeats that must not collapse) harder than the parser. A bad parse logs a warning; a bad week or identity key silently duplicates rows.
+
+Fixtures come from the three payloads in `json-files/`. The November DST case has no real payload behind it — hand-build it.
 
 ## 2. Database — Supabase
 
@@ -44,7 +38,7 @@ Keep the string local for now; it goes into SSM in step 5.
 
 Once, laptop → Supabase, raw `.sql`. No Alembic. Creates `raw_snapshots`, `events`, `fetch_log`, indexes, and the four empty `actual_*` columns (spec §4).
 
-**`events` gets a named `UNIQUE` constraint on `(country, normalized_title, week_key, event_timestamp)`.** `source_suffix` does *not* participate — it's drift for `normalize_title` to absorb.
+**`events` gets a named `UNIQUE` constraint on `(country, normalized_title, week_key, event_timestamp)`.** `source_suffix` does *not* participate — it's display provenance, not identity, and this feed doesn't emit one anyway.
 
 Must be a constraint, not a convention: step 4's `ON CONFLICT` needs a target, and step 10's check only means something if the DB enforced it all along. Changing it later means deduplicating first.
 
@@ -85,7 +79,7 @@ Check the Lambda runtime deprecation calendar — with no template, a runtime bu
 2. **Schedules**, cron in UTC — four daily harvest slots, Saturday sweep with `week_final: true`.
 3. **Retry rule 10 minutes after each main slot**, firing unconditionally. The guard exits immediately if the paired attempt succeeded. Costs nothing when healthy, survives the process being killed. Configuration only — if you're writing skip logic here, it belongs in `guard.py`.
 
-**Set the sweep time from Phase 0, not the placeholder.** Spec §3's Sat 23:00 UTC assumes rollover at or after midnight ET.
+**Sweep goes at `0 11 * * 6` (Sat 07:00 ET), not spec §3's Sat 23:00 UTC.** 23:00 UTC is 19:00 ET and the rollover was never pinned tighter than "sometime in the 24h after Sat 07:48 ET" — a sweep on the wrong side of it loses the closing week for good. Early costs nothing: the endpoint has no `actual` field and past rows never change.
 
 ## 8. Export function
 
@@ -116,7 +110,7 @@ Run spec §9 as real queries.
 
 - `fetch_log`: an `ok` row per slot, no gap > 8h, no `rate_limited`.
 - Both `week_final=true` snapshots exist **and their S3 objects are readable**.
-- Each identity tuple appears once per `week_key`. Rows here mean the constraint is wrong, not the data. The opposite failure — `normalize_title` merging distinct events — no constraint catches: compare rows per `(country, week_key)` against the raw payload count.
+- Each identity tuple appears once per `week_key`. Rows here mean the constraint is wrong, not the data. The opposite failure — `normalize_title` merging distinct events — no constraint catches: compare rows per `(country, week_key)` against the raw payload count. **Read the direction.** Above the payload count is stale reschedule rows, which are expected; below it is over-merging, which is the real defect.
 - Sunday events share a `week_key` with the Monday events after them. Week two is the first time the week-identity bug can show.
 - Two `HEALTH` lines, both `ok`. If it never ran, the other checks told you nothing.
 
