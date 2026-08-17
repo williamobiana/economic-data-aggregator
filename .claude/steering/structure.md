@@ -40,8 +40,8 @@ Fixtures come from `json-files/`. The DST case has no real payload behind it —
 
 ## Documents
 
-- `project-idea.md` — the spec (v1.2): what and why.
-- `project-idea-steps.md` — the build order: in what order. **Newer of the two; wins on conflicts.**
+- `idea/project-idea.md` — the spec (v1.2): what and why.
+- `idea/project-idea-steps.md` — the build order: in what order. **Newer of the two; wins on conflicts.**
 - Obsidian vault (`/home/user/workspace/lab/second-brain`) — Phase 0 findings and decision history. Step 0 was deleted from the steps document, so the vault is their **sole** record: `Notes/2026-08-17 - Economic Data Aggregator`.
 
 ## Build order
