@@ -1,6 +1,6 @@
 # FF Harvester MVP — Spec v1.2
 
-**Scope:** archive what the ForexFactory feed provides — **schedule, forecast, previous** — for the 8 majors. Actuals are out of scope; their columns exist now and stay NULL, so that iteration needs no migration.
+**Scope:** archive what the ForexFactory feed provides — **schedule, forecast, previous** — for the 8 majors plus `CNY`. Actuals are out of scope; their columns exist now and stay NULL, so that iteration needs no migration.
 
 **Stack:** Python 3.11, Lambda + EventBridge, Supabase Postgres, raw payloads in S3.
 
@@ -10,7 +10,7 @@ Spec says *what* and *why*. `project-idea-steps.md` says *in what order* — it 
 
 ## 1. Product statement
 
-A scheduled Lambda downloads `https://nfs.faireconomy.media/ff_calendar_thisweek.json` four times a day, validates it, and upserts every majors event into Postgres. The feed only ever shows the current week, so this archive — every forecast and previous value as published, week after week — cannot be rebuilt retroactively. The job is: **never miss a week, never corrupt a value.** Output: an `events` table plus a CSV/JSON export.
+A scheduled Lambda downloads `https://nfs.faireconomy.media/ff_calendar_thisweek.json` four times a day, validates it, and upserts every tracked event into Postgres. The feed only ever shows the current week, so this archive — every forecast and previous value as published, week after week — cannot be rebuilt retroactively. The job is: **never miss a week, never corrupt a value.** Output: an `events` table plus a CSV/JSON export.
 
 ---
 
@@ -21,7 +21,7 @@ A scheduled Lambda downloads `https://nfs.faireconomy.media/ff_calendar_thisweek
 ```
 
 - `title` — display string; unescape slashes on parse.
-- `country` — keep `USD, EUR, GBP, JPY, AUD, NZD, CAD, CHF, CNY`.
+- `country` — keep `USD, EUR, GBP, JPY, AUD, NZD, CAD, CHF, CNY` — the 8 majors plus `CNY`, which is the only other code the feed emits. **All impact levels.** You can't retro-collect what you filter out.
 - `date` — ISO 8601 with offset, on **every** row without exception. Convert to UTC at ingestion. **Parse the offset from the string, never hard-code `-04:00`** — it becomes `-05:00` in November and every winter event silently shifts an hour.
 - `impact` — `High | Medium | Low | Holiday`; log unknown variants. **There is no Tentative marker** — tentative releases carry a fake minute-precise time and simply move.
 - `forecast`, `previous` — display strings. **Blank is common and valid** (80 of 244 rows measured). There is **no `actual` field**.
@@ -92,6 +92,7 @@ source_suffix    text,                   -- 'K' | 'M' | 'B' — provenance only
 actual_raw text, actual_num numeric, actual_source text, actual_first_seen_at timestamptz,
 first_seen_at    timestamptz NOT NULL,
 last_updated_at  timestamptz NOT NULL,
+superseded_at    timestamptz,            -- NULL = live; set when the row leaves its week's payload
 
 CONSTRAINT events_identity UNIQUE (country, normalized_title, week_key, event_timestamp)
 ```
@@ -99,25 +100,36 @@ CONSTRAINT events_identity UNIQUE (country, normalized_title, week_key, event_ti
 ```sql
 CREATE INDEX ON events (event_timestamp);
 CREATE INDEX ON events (country, event_timestamp);
-CREATE INDEX ON events (week_key);
+CREATE INDEX ON events (week_key) WHERE superseded_at IS NULL;
 ```
 
 **Identity is the named constraint, not a convention** — the upsert's `ON CONFLICT` needs a real target, and §9's duplicate check proves nothing unless the database enforced it from the first insert. Changing it after rows exist means deduplicating first. `normalize` = trim, collapse whitespace, lowercase, unescape slashes.
 
-**`event_timestamp` is in the key, so a rescheduled event lands as a second row** and the old one is never retracted — measured, 79 rows against a closing 74. Accepted for the MVP; supersession is a later pass. Both weaker keys were tested and rejected: dropping `event_timestamp` merges a speaker appearing twice in a week, truncating to the date merges two rows with different `previous`.
+**`event_timestamp` is in the key, so a rescheduled event lands as a second row** — measured, 79 rows against a closing 74. Both weaker keys were tested and rejected: dropping `event_timestamp` merges a speaker appearing twice in a week, truncating to the date merges two rows with different `previous`. So the key stays and the stale row is retired instead.
 
 Upsert — **only write when something actually changed**, or `last_updated_at` degrades to "last fetched" and `events_updated` reports the whole week every run:
 
 ```sql
-ON CONFLICT ON CONSTRAINT events_identity DO UPDATE SET ..., last_updated_at = now()
-WHERE (events.impact, events.forecast_raw, events.previous_raw)
+ON CONFLICT ON CONSTRAINT events_identity DO UPDATE
+SET ..., superseded_at = NULL, last_updated_at = now()
+WHERE (events.impact, events.forecast_raw, events.previous_raw, events.superseded_at)
       IS DISTINCT FROM
-      (EXCLUDED.impact, EXCLUDED.forecast_raw, EXCLUDED.previous_raw)
+      (EXCLUDED.impact, EXCLUDED.forecast_raw, EXCLUDED.previous_raw, NULL)
 ```
 
-`IS DISTINCT FROM`, not `<>`, so NULLs compare correctly.
+`IS DISTINCT FROM`, not `<>`, so NULLs compare correctly. `superseded_at` is in the comparison so a returning event is revived even when its values are unchanged.
 
-**`fetch_log`** — one row per attempt: `fetched_at, week_final, http_status, outcome ('ok'|'rate_limited'|'parse_error'|'network'|'empty'), events_seen, events_new, events_updated`. Gap detector and health record.
+**Supersession.** Every payload is the complete week, so any live row for that `week_key` absent from it is stale. Same transaction, straight after the upsert:
+
+```sql
+UPDATE events SET superseded_at = now(), last_updated_at = now()
+WHERE week_key = %(week_key)s AND superseded_at IS NULL
+  AND event_key <> ALL(%(keys_seen)s)
+```
+
+Soft delete — the row is never removed, and reads default to `WHERE superseded_at IS NULL`. Reschedules, cancellations and deferrals all resolve through this one statement. **It self-heals:** a row wrongly retired by a truncated payload is revived by the next slot's upsert, so the blast radius is one slot rather than the archive. Scope it by `week_key` from the payload's contents and it can never touch a closed week.
+
+**`fetch_log`** — one row per attempt: `fetched_at, week_final, http_status, outcome ('ok'|'rate_limited'|'parse_error'|'network'|'empty'), events_seen, events_new, events_updated, events_superseded`. Gap detector and health record.
 
 ---
 
@@ -175,9 +187,9 @@ ff-harvester/
 
 Everything under `src/` except `handler.py` stays pure — no AWS imports, no DB connection — so it runs under plain `pytest` with no mocking. `datetime.fromisoformat` handles the feed's offset natively and `zoneinfo` does the week arithmetic, but **ship `tzdata` to Lambda**, whose image has no system tz database.
 
-**Validation order:** `guard.already_satisfied` → HTTP 200 → `Content-Type`/first-char check (HTML = rate-limited, abort) → `json.loads` → non-empty list → required fields → filter to 8 currencies → **snapshot raw to S3** → parse → upsert → write `fetch_log`. Snapshot before parsing, so a parser crash still leaves the payload recoverable.
+**Validation order:** `guard.already_satisfied` → HTTP 200 → `Content-Type`/first-char check (HTML = rate-limited, abort) → `json.loads` → non-empty list → required fields → filter to the 9 tracked currencies → **snapshot raw to S3** → parse → upsert → supersede → write `fetch_log`. Snapshot before parsing, so a parser crash still leaves the payload recoverable. Upsert and supersede share one transaction.
 
-**Export:** full dump to `exports/<date>/events.csv` — dated, because versioning is off and a fixed key would destroy the previous dump.
+**Export:** full dump of live rows to `exports/<date>/events.csv` — dated, because versioning is off and a fixed key would destroy the previous dump.
 
 **Alerting:** no SNS yet. Two CloudWatch alarms with no actions attached, plus a `HEALTH ok slots=28 gaps=0` line the export function logs after the `fetch_log` gap query. Wire SNS when remembering to look becomes the failure mode.
 
@@ -197,7 +209,8 @@ See `project-idea-steps.md`. Roughly 2–3 evenings: pure modules with tests →
 | Sweep on the wrong side of rollover | Sweep set early (Sat 07:00 ET) rather than at the untested boundary |
 | Week boundary mis-resolved → Sunday events duplicated | One `ff_week_start`, Sunday-start and NY-based; §9 checks it directly |
 | DST shift misreads every timestamp by an hour | Offset parsed from the feed, never assumed. **No real payload exercises `-05:00` yet** — hand-build that fixture |
-| Reschedule leaves a stale row | Known and accepted; §9 reads the *direction* of the row-count mismatch |
+| Reschedule leaves a stale row | Supersession pass retires it; §9 checks live rows against the payload count |
+| Supersession retires a real row after a truncated payload | Self-healing — the next slot's upsert revives it; blast radius is one slot |
 | Feed URL/schema change | Strict validation fails loudly; raw snapshots make recovery a reparse, not a loss |
 | Rate-limit ban | 5-min floor; separate retry slot, no in-process loop; `reserved_concurrency=1`, Lambda retries 0 |
 | Scheduler drift | Harmless at this cadence; `fetch_log` reveals gaps |
@@ -212,15 +225,15 @@ Two consecutive weeks unattended, every row a query you can run:
 |---|---|
 | No missed fetches | An `ok` row per scheduled slot; no gap > 8h |
 | Both sweeps captured | 2 rows with `week_final=true`, each with a readable S3 object |
-| Idempotent | Re-running a completed slot yields `events_new=0, events_updated=0` |
+| Idempotent | Re-running a completed slot yields `events_new=0, events_updated=0, events_superseded=0` |
 | Week identity intact | One row per identity tuple per `week_key`; Sunday events share a `week_key` with the Monday events after them |
-| No over-merging | Rows per `(country, week_key)` are **not fewer** than the raw payload's count |
+| Row count exact | Live rows per `(country, week_key)` **equal** the final payload's count |
 | Parse coverage | Zero warnings on non-blank values, or each traced to a format now covered by a fixture |
 | Export | One CSV + one JSON in `exports/<date>/`, row count matching `SELECT count(*) FROM events` |
 | Health | Two `HEALTH` lines, both `ok` — if it never ran, the other checks told you nothing |
 | No rate limiting | Zero `rate_limited` outcomes |
 
-On the over-merging row, **read the direction**: above the payload count is stale reschedule rows, which are expected; below it is `normalize_title` merging two distinct events, which no constraint can catch and is the real defect.
+On the row-count check, **read the direction**: *below* the payload count means `normalize_title` merged two distinct events — the one corruption no constraint can catch. *Above* means supersession didn't run. Neither is acceptable now, which is the point of making it an equality.
 
 ---
 

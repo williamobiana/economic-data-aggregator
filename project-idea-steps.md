@@ -36,7 +36,7 @@ Keep the string local for now; it goes into SSM in step 5.
 
 ## 3. Run the migration
 
-Once, laptop → Supabase, raw `.sql`. No Alembic. Creates `raw_snapshots`, `events`, `fetch_log`, indexes, and the four empty `actual_*` columns (spec §4).
+Once, laptop → Supabase, raw `.sql`. No Alembic. Creates `raw_snapshots`, `events`, `fetch_log`, indexes, `superseded_at`, and the four empty `actual_*` columns (spec §4).
 
 **`events` gets a named `UNIQUE` constraint on `(country, normalized_title, week_key, event_timestamp)`.** `source_suffix` does *not* participate — it's display provenance, not identity, and this feed doesn't emit one anyway.
 
@@ -46,12 +46,13 @@ Must be a constraint, not a convention: step 4's `ON CONFLICT` needs a target, a
 
 Local; runs against AWS in step 6.
 
-Spec §6 order: **guard on `fetch_log`** → fetch → reject HTML → `json.loads` → non-empty list → required fields → filter to 8 currencies → **put raw to S3** → parse → upsert → write `fetch_log`.
+Spec §6 order: **guard on `fetch_log`** → fetch → reject HTML → `json.loads` → non-empty list → required fields → filter to the 9 tracked currencies → **put raw to S3** → parse → upsert → **supersede** → write `fetch_log`.
 
 - Guard calls `guard.already_satisfied`. The handler fetches rows and acts on the answer; it doesn't re-derive it.
 - S3 before parse, so a parser crash still leaves the payload recoverable.
 - `week_final` from the event payload — one function, every schedule.
-- Conditional upsert (`IS DISTINCT FROM`, spec §4) targeting the step 3 constraint.
+- Conditional upsert (`IS DISTINCT FROM`, spec §4) targeting the step 3 constraint. `superseded_at` is in the comparison and reset to `NULL` on update, so a returning event revives even when its values haven't changed.
+- **Supersede in the same transaction as the upsert**, scoped to the `week_key` the payload itself yields — never to a `week_key` derived from the clock. Retiring rows in a week this payload doesn't cover is the one way this step can destroy data.
 - `httpx`, **10s connect / 20s read timeout**. A hung socket costs the whole slot.
 
 ## 5. AWS prerequisites
@@ -110,7 +111,7 @@ Run spec §9 as real queries.
 
 - `fetch_log`: an `ok` row per slot, no gap > 8h, no `rate_limited`.
 - Both `week_final=true` snapshots exist **and their S3 objects are readable**.
-- Each identity tuple appears once per `week_key`. Rows here mean the constraint is wrong, not the data. The opposite failure — `normalize_title` merging distinct events — no constraint catches: compare rows per `(country, week_key)` against the raw payload count. **Read the direction.** Above the payload count is stale reschedule rows, which are expected; below it is over-merging, which is the real defect.
+- Each identity tuple appears once per `week_key`. Rows here mean the constraint is wrong, not the data. The opposite failure — `normalize_title` merging distinct events — no constraint catches: compare **live** rows per `(country, week_key)` against the raw payload count. They must be **equal**. **Read the direction.** Below the payload count is over-merging; above it means supersession didn't run.
 - Sunday events share a `week_key` with the Monday events after them. Week two is the first time the week-identity bug can show.
 - Two `HEALTH` lines, both `ok`. If it never ran, the other checks told you nothing.
 
