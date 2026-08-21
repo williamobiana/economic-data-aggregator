@@ -23,7 +23,7 @@ Output: an `events` table plus a dated CSV/JSON export to S3.
 | Retry | each slot + 10 min, fires unconditionally |
 | Export | Sunday, after the sweep |
 
-The sweep is deliberately early. Rollover is bracketed to the 24h after Sat 07:48 ET but never pinned; a sweep on the wrong side of it loses the closing week for good. Early costs nothing — there is no `actual` field and past rows are byte-identical across re-fetches.
+The sweep is deliberately early. Rollover is **Sat 19:00 ET** — anchored to ET, since a UTC anchor drifts an hour in November. A sweep on the wrong side of it loses the closing week for good; Sat 07:00 ET clears it by roughly twelve hours in either season. Early costs nothing — there is no `actual` field and past rows are byte-identical across re-fetches.
 
 ## Definition of done
 

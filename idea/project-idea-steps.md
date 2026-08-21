@@ -1,8 +1,10 @@
 # FF Harvester — build & deploy steps
 
-Companion to `project-idea.md` (spec v1.2). Spec says *what* and *why*; this says *in what order*. This document is the newer of the two — the spec is refactored from it, not the other way round.
+Companion to `project-idea.md` (spec v1.2). Spec says *what* and *why*; this says *in what order*.
 
-**Target:** Python 3.11, AWS Lambda, Supabase Postgres, S3. Steps 1–4 are AWS-free. Manual deploy, no IaC.
+**Superseded on conflict by `.claude/specs/ff-harvester/requirements.md` and `design.md`.** Both are newer than this document and than the spec; where any of them disagree, the spec documents win. The step order below matches the requirement numbering (step N = Requirement N).
+
+**Target:** Python 3.11, AWS Lambda, Supabase Postgres, S3. Steps 1–3 are AWS-free. Manual deploy, no IaC.
 
 Build in this order — each step depends on the ones above.
 
@@ -15,7 +17,7 @@ No AWS, no database, no mocking.
 - `parse.py` — spec §5. `num` expanded, `unit` a dimension, scale suffix separate, `flag` returned *and* persisted. Frozen `@dataclass`, not a dict.
 - `week.py` — `ff_week_start`. Sunday-start, `America/New_York`. Not ISO weeks — `isocalendar()` starts Monday and splits each feed week.
 - `identity.py` — `normalize_title` + `event_key`. The one definition of "same event". Titles were measured and do not drift, so assert the negative — same `(country, date)` across fetches yields the same title — and assert distinct events stay distinct.
-- `guard.py` — `already_satisfied(rows, slot)`. Pure logic over query results, no connection. Step 7 depends on it.
+- `guard.py` — `already_satisfied(rows, slot, now)`. Pure logic over query results, no connection. `now` is a parameter, not a clock read — the 5-minute rate-limit floor lives here and needs to be testable. Step 8 depends on it.
 
 Stdlib only:
 
@@ -32,7 +34,7 @@ Fixtures come from the three payloads in `json-files/`. The November DST case ha
 - **`psycopg` v3, binary extra.** Ignore the Supabase client libraries; this is plain Postgres.
 - Free projects pause after ~7 days idle. Four fetches a day means it never fires.
 
-Keep the string local for now; it goes into SSM in step 5.
+Keep the string local for now; it goes into SSM in step 6.
 
 ## 3. Run the migration
 
@@ -40,11 +42,21 @@ Once, laptop → Supabase, raw `.sql`. No Alembic. Creates `raw_snapshots`, `eve
 
 **`events` gets a named `UNIQUE` constraint on `(country, normalized_title, week_key, event_timestamp)`.** `source_suffix` does *not* participate — it's display provenance, not identity, and this feed doesn't emit one anyway.
 
-Must be a constraint, not a convention: step 4's `ON CONFLICT` needs a target, and step 10's check only means something if the DB enforced it all along. Changing it later means deduplicating first.
+Must be a constraint, not a convention: step 5's `ON CONFLICT` needs a target, and step 11's check only means something if the DB enforced it all along. Changing it later means deduplicating first.
 
-## 4. Write the handler
+## 4. S3 bucket
 
-Local; runs against AWS in step 6.
+First AWS step, and it comes **before** the handler — step 5's checks assert that a `raw/` object landed and that two invocations within a minute produce two distinct keys. Neither can run against a bucket that doesn't exist.
+
+- Prefixes `raw/<week_key>/<fetched_at>.json` and `exports/<date>/`.
+- Block public access, **versioning off**, **no lifecycle expiry on `raw/`**. Lifecycle on `exports/` is fine.
+- With versioning off, the `<fetched_at>` timestamp is the only thing preventing overwrites — don't simplify that key.
+
+Local runs write to this bucket under the developer's own credentials from `~/.aws/credentials`; Lambda uses the execution role from step 6. `boto3` resolves both through its default chain, so nothing in the code changes between them. Install `boto3` locally as a dev dependency — it must not enter `requirements.txt` or the layer, since the Lambda runtime already ships it.
+
+## 5. Write the handler
+
+Local, against the real bucket and the real database. Deployed in step 7.
 
 Spec §6 order: **guard on `fetch_log`** → fetch → reject HTML → `json.loads` → non-empty list → required fields → filter to the 9 tracked currencies → **put raw to S3** → parse → upsert → **supersede** → write `fetch_log`.
 
@@ -55,44 +67,42 @@ Spec §6 order: **guard on `fetch_log`** → fetch → reject HTML → `json.loa
 - **Supersede in the same transaction as the upsert**, scoped to the `week_key` the payload itself yields — never to a `week_key` derived from the clock. Retiring rows in a week this payload doesn't cover is the one way this step can destroy data.
 - `httpx`, **10s connect / 20s read timeout**. A hung socket costs the whole slot.
 
-## 5. AWS prerequisites
+## 6. Remaining AWS prerequisites
 
-First AWS step. Four resources, in order.
+Three resources, in order. The bucket is already up from step 4.
 
-1. **S3 bucket** — prefixes `raw/<week_key>/<fetched_at>.json` and `exports/`. Block public access, **versioning off**, **no lifecycle expiry on `raw/`**. Lifecycle on `exports/` is fine.
-   With versioning off, the `<fetched_at>` timestamp is the only thing preventing overwrites — don't simplify that key.
-2. **SSM parameter** — `SecureString`, the pooler string from step 2. Not Secrets Manager ($0.40/secret/month breaks the $0 target).
-3. **IAM role: Lambda execution** — trust `lambda.amazonaws.com`. `AWSLambdaBasicExecutionRole`, `ssm:GetParameter` on that one parameter, `kms:Decrypt`, `s3:PutObject` on `<bucket>/raw/*` and `<bucket>/exports/*`. Nothing else. Both functions share it.
-4. **Lambda layer** — `psycopg[binary]`, `httpx`, `tzdata`. Build for `manylinux` in Docker/CloudShell/EC2, **not** from your laptop's `site-packages`.
+1. **SSM parameter** — `SecureString`, the pooler string from step 2. Not Secrets Manager ($0.40/secret/month breaks the $0 target).
+2. **IAM role: Lambda execution** — trust `lambda.amazonaws.com`. `AWSLambdaBasicExecutionRole`, `ssm:GetParameter` on that one parameter, `kms:Decrypt`, `s3:PutObject` on `<bucket>/raw/*` and `<bucket>/exports/*`. Nothing else. Both functions share it.
+3. **Lambda layer** — `psycopg[binary]`, `httpx`, `tzdata`. Build for `manylinux` in Docker/CloudShell/EC2, **not** from your laptop's `site-packages`.
 
-## 6. Deploy the harvester, invoke by hand
+## 7. Deploy the harvester, invoke by hand
 
-1. **Create the function** — `python3.11`, timeout 30s, **reserved concurrency 1**, layer attached, env vars for bucket + parameter name, role from step 5.
-2. **Async invoke config: `MaximumRetryAttempts: 0`.** Separate console screen; easiest thing here to miss. You want step 7's 10-minute retry, not an instant one that gets you rate-limited.
+1. **Create the function** — `python3.11`, timeout 30s, **reserved concurrency 1**, layer attached, env vars for bucket + parameter name, role from step 6.
+2. **Async invoke config: `MaximumRetryAttempts: 0`.** Separate console screen; easiest thing here to miss. You want step 8's 10-minute retry, not an instant one that gets you rate-limited.
 3. **Invoke once manually**, before any schedule. Cheapest place to catch a wrong connection string, missing IAM permission, or a layer built for the wrong platform. Confirm: a `raw/` object landed, `events` has rows, `fetch_log` has one `ok`.
 4. **Set log retention to 30 days.** The log group only exists after that first invoke, and defaults to never expire.
 
 Check the Lambda runtime deprecation calendar — with no template, a runtime bump is a manual edit per function.
 
-## 7. EventBridge schedules
+## 8. EventBridge schedules
 
-1. **Scheduler IAM role** — trust `scheduler.amazonaws.com`, `lambda:InvokeFunction` on the harvester. Needs its own role; won't reuse the Lambda one. Step 8 adds the export ARN.
+1. **Scheduler IAM role** — trust `scheduler.amazonaws.com`, `lambda:InvokeFunction` on the harvester. Needs its own role; won't reuse the Lambda one. Step 9 extends this same role to the export ARN rather than adding a second.
 2. **Schedules**, cron in UTC — four daily harvest slots, Saturday sweep with `week_final: true`.
-3. **Retry rule 10 minutes after each main slot**, firing unconditionally. The guard exits immediately if the paired attempt succeeded. Costs nothing when healthy, survives the process being killed. Configuration only — if you're writing skip logic here, it belongs in `guard.py`.
+3. **Retry rule 10 minutes after each main slot**, firing unconditionally, including one for the sweep. The guard exits immediately if the paired attempt succeeded. Costs nothing when healthy, survives the process being killed. Configuration only — if you're writing skip logic here, it belongs in `guard.py`.
 
-**Sweep goes at `0 11 * * 6` (Sat 07:00 ET), not spec §3's Sat 23:00 UTC.** 23:00 UTC is 19:00 ET and the rollover was never pinned tighter than "sometime in the 24h after Sat 07:48 ET" — a sweep on the wrong side of it loses the closing week for good. Early costs nothing: the endpoint has no `actual` field and past rows never change.
+**Sweep goes at `0 11 * * 6` (Sat 07:00 ET).** The feed rolls over **Saturday 19:00 ET**, so the once-provisional `0 23 * * 6` sat exactly on it in summer — a coin flip on which week you fetch. Sat 07:00 ET clears the roll by about twelve hours in either season. Early costs nothing: the endpoint has no `actual` field and past rows never change.
 
-## 8. Export function
+## 9. Export function
 
-Before alerting — step 9's health check runs inside this function.
+Before alerting — step 10's health check runs inside this function.
 
-Dumps `events` to CSV + JSON on a Sunday schedule after the sweep. `csv.DictWriter`, `json.dump`, temp file, upload. Full dump, not incremental. Same role and layer.
+Dumps `events` to CSV + JSON on a Sunday schedule after the sweep. `csv.DictWriter`, `json.dump`, temp file, upload. Full dump of **live rows** (`WHERE superseded_at IS NULL`), not incremental. Same role and layer.
 
 **Write to `exports/<date>/events.csv`.** A fixed key destroys last week's dump; the date replaces version history.
 
-Deploy as in step 6 — create, invoke by hand, set retention. Then add its ARN to the scheduler role and create the Sunday schedule.
+Deploy as in step 7 — create, invoke by hand, set retention. Then add its ARN to the scheduler role and create the Sunday schedule.
 
-## 9. Failure alerting
+## 10. Failure alerting
 
 **No SNS or email for now**, so alarms are eyes-only and nothing looks at them on its own. The check moves into code.
 
@@ -105,7 +115,7 @@ Create **two CloudWatch alarms**, no actions attached:
 
 Wire SNS → email when remembering to look becomes the failure mode.
 
-## 10. Week-two check
+## 11. Week-two check
 
 Run spec §9 as real queries.
 

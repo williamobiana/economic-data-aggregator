@@ -41,7 +41,7 @@ Constraints: ~2 downloads per 5 min per IP; rate-limit responses are HTML, not J
 | Retry slots | each slot + 10 min | Fires unconditionally; no-ops if `fetch_log` shows the paired attempt succeeded |
 | Export | Sunday, after the sweep | Full dump to `exports/<date>/` |
 
-**The sweep is deliberately early.** Rollover was bracketed to the 24h after Sat 07:48 ET, never pinned, and a sweep on the wrong side of it loses the closing week permanently. Early costs nothing: no `actual` field, past rows never change, so the week is settled by Saturday morning.
+**The sweep is deliberately early.** Rollover is **Sat 19:00 ET** — anchored to ET, not UTC, since it drifts an hour in November. A sweep on the wrong side of it loses the closing week permanently. The provisional `0 23 * * 6` this table replaced *is* 19:00 ET in summer, sitting exactly on the roll; `0 11 * * 6` clears it by roughly twelve hours in either season. Early costs nothing: no `actual` field, past rows never change, so the week is settled by Saturday morning.
 
 Failure policy: on non-JSON, HTTP error, or empty array → write `fetch_log` and exit. **No in-process sleep-retry**; the paired retry slot handles it. One retry per slot, 5-minute hard floor between any two requests.
 
