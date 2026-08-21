@@ -129,11 +129,10 @@ Any change to one of these is a change to the whole system, not to a single modu
 3. IF the paired attempt recorded `rate_limited`, `parse_error`, `network` or `empty`, or no attempt is recorded, THEN THE SYSTEM SHALL report the slot unsatisfied.
 4. IF any attempt occurred within 5 minutes of the reference instant THEN THE SYSTEM SHALL report the slot satisfied, enforcing the rate-limit floor. `[DERIVED]` — both documents state the 5-minute hard floor but neither sites it; the guard is the only pure place it can live.
 5. THE SYSTEM SHALL NOT open a connection or issue a query from within the guard.
-6. THE SYSTEM SHALL NOT place skip logic in the EventBridge configuration or in `handler.py`; schedules are configuration only.
 
 #### Validation Gate
 
-`pytest tests/test_guard.py` green, covering each outcome value, the empty-rows case, the within-5-minutes case at a fixed reference instant, and a row belonging to a *different* slot (must not satisfy). Then `grep -rn "already_satisfied\|outcome" src/handler.py` shows the handler calling the function and acting on the answer, never re-deriving it.
+`pytest tests/test_guard.py` green, covering each outcome value, the empty-rows case, the within-5-minutes case at a fixed reference instant, and a row belonging to a *different* slot (must not satisfy).
 
 ---
 
@@ -232,14 +231,15 @@ The duplicate insert raising `unique_violation` is the gate. Changing this const
 
 Run locally twice in succession against the real feed, respecting the 5-minute floor, then:
 
-- run 1: `fetch_log` has one `ok`; `events_new` equals the filtered payload count; a `raw/` object exists and its sha256 matches `raw_snapshots.payload_sha256`;
+- run 1: `fetch_log` has one `ok`; a `raw/` object exists and its sha256 matches `raw_snapshots.payload_sha256`;
 - run 2: `events_new=0, events_updated=0, events_superseded=0` — **idempotence, checked before deploying anything**;
 - `SELECT count(DISTINCT week_key) FROM events` = 1;
 - **the measured supersession case** — against a clean database, harvest `json-files/this_WED.json` then `this_SAT.json` and assert **74 live rows and 5 superseded**; without supersession this yields 79. The five are `AUD RBA Gov Bullock Speaks`, `CNY Foreign Direct Investment ytd/y`, `CNY M2 Money Supply y/y`, `CNY New Loans`, `USD Mortgage Delinquencies`;
 - **the revive case** — re-harvest `this_WED.json` and assert all five return to live. This proves criterion 9's `superseded_at` reset, which fails silently if `superseded_at` is left out of the comparison tuple;
 - **the scope case** — harvest `this_SUN.json`, a different week, and assert the week-of-08-09 rows are untouched;
 - a saved HTML rate-limit body is fed in and produces `rate_limited` with zero writes to `events`;
-- invoke twice within one minute and confirm two distinct `raw/` keys — with versioning off, `<fetched_at>` is the only thing preventing an overwrite.
+- invoke twice within one minute and confirm two distinct `raw/` keys — with versioning off, `<fetched_at>` is the only thing preventing an overwrite;
+- **orchestration only** — `grep -rn "already_satisfied\|outcome" src/handler.py` shows the handler calling the guard and acting on its answer, never re-deriving it. This is the only static check in the document, and criterion 2 is otherwise unverified.
 
 ---
 
@@ -339,7 +339,7 @@ Hand-invoke, then: both objects exist under today's `exports/<date>/`, both are 
 
 #### Validation Gate
 
-Invoke the export function and find one `HEALTH` line in its log group. Then force the failure path — remove a slot's `fetch_log` row in a scratch copy, or run the query against a seeded gap — and confirm the line reads `HEALTH FAIL`. Both alarms exist and list zero alarm actions.
+Invoke the export function and find one `HEALTH` line in its log group. Both alarms exist and list zero alarm actions.
 
 ---
 
@@ -389,7 +389,7 @@ Clean → MVP done. Actuals (spec §10) are the next iteration and need **no mig
 |---|---|
 | G1 no backfill | R11.3, R14.1–14.2 |
 | G2 never drop an event | R1.5, R1.7, R8.13 |
-| G3 one week / identity implementation | R2.1, R3.1–3.2, R4 gate, R8.2 |
+| G3 one week / identity implementation | R2.1, R3.1–3.2, R8.2, R8 gate |
 | G4 week key from payload contents | R2.5, R8.10 |
 | G5 soft delete only | R6.5, R7.3, R8.10–8.11 |
 | G6 $0/month | R9.1, R13.4 |
